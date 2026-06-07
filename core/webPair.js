@@ -9,25 +9,26 @@ const {
   default: makeWASocket,
   useMultiFileAuthState,
   fetchLatestBaileysVersion,
+  DisconnectReason,
   Browsers,
 } = require('@whiskeysockets/baileys');
 
-const path    = require('path');
-const fs      = require('fs');
-const logger  = require('../utils/logger');
-const config  = require('../config/config');
+const path   = require('path');
+const fs     = require('fs');
+const logger = require('../utils/logger');
+const config = require('../config/config');
 
 const pendingPairs = new Map();
 
 async function generatePairCode(number) {
   const clean = number.replace(/[^0-9]/g, '');
-  const sessionDir = path.join('./sessions', clean);
+  const sessionDir = path.join('./sessions', `web_${clean}`);
 
   if (!fs.existsSync(sessionDir)) {
     fs.mkdirSync(sessionDir, { recursive: true });
   }
 
-  // If already pending — return existing
+  // Already pending — return existing code
   if (pendingPairs.has(clean)) {
     return pendingPairs.get(clean).code;
   }
@@ -41,25 +42,40 @@ async function generatePairCode(number) {
       auth: state,
       printQRInTerminal: false,
       browser: Browsers.ubuntu('Chrome'),
-      logger: { level: 'silent', child: () => ({ level: 'silent', info: ()=>{}, warn: ()=>{}, error: ()=>{}, debug: ()=>{}, trace: ()=>{}, fatal: ()=>{} }), info: ()=>{}, warn: ()=>{}, error: ()=>{}, debug: ()=>{}, trace: ()=>{}, fatal: ()=>{} },
+      logger: {
+        level: 'silent',
+        child: () => ({ level: 'silent', info:()=>{}, warn:()=>{}, error:()=>{}, debug:()=>{}, trace:()=>{}, fatal:()=>{} }),
+        info:()=>{}, warn:()=>{}, error:()=>{}, debug:()=>{}, trace:()=>{}, fatal:()=>{}
+      },
+      syncFullHistory: false,
+      markOnlineOnConnect: false,
     });
 
     sock.ev.on('creds.update', saveCreds);
 
     let resolved = false;
 
-    // Request pair code
+    // Request pair code after 1.5s
     setTimeout(async () => {
       try {
+        if (sock.authState.creds.registered) {
+          if (!resolved) {
+            resolved = true;
+            reject(new Error('Number already registered — try another number'));
+          }
+          return;
+        }
+
         const code = await sock.requestPairingCode(clean);
         const formatted = code?.match(/.{1,4}/g)?.join('-') || code;
+        
         pendingPairs.set(clean, { code: formatted, sock });
 
-        // Auto expire after 2 min
+        // Auto cleanup after 3 min
         setTimeout(() => {
           pendingPairs.delete(clean);
           try { sock.end(); } catch {}
-        }, 120000);
+        }, 180000);
 
         if (!resolved) {
           resolved = true;
@@ -71,37 +87,55 @@ async function generatePairCode(number) {
           reject(e);
         }
       }
-    }, 2000);
+    }, 1500);
 
-    // On connected
+    // Connection update handler
     sock.ev.on('connection.update', async (update) => {
       const { connection, lastDisconnect } = update;
+
       if (connection === 'open') {
-        logger.success(`✅ ${clean} connected via web pair!`);
+        logger.success(`✅ ${clean} paired successfully via website!`);
         pendingPairs.delete(clean);
 
-        // Load message handler
+        // Start message handler for this session
         try {
-          const { handleMessage, setOwner } = require('../handlers/messageHandler');
-          setOwner(sock, config.ownerNumber);
+          const { handleMessage } = require('../handlers/messageHandler');
           sock.ev.on('messages.upsert', async ({ messages, type }) => {
             if (type !== 'notify') return;
             for (const msg of messages) {
-              try { await handleMessage(sock, msg); } catch {}
+              try { await handleMessage(sock, msg); } catch (e) {}
             }
           });
+          logger.success(`✅ Message handler started for ${clean}`);
         } catch (e) {
-          logger.error('Handler load error:', e.message);
+          logger.error('Handler error:', e.message);
+        }
+      }
+
+      if (connection === 'close') {
+        const reason = lastDisconnect?.error?.output?.statusCode;
+        logger.warn(`Connection closed for ${clean}, reason: ${reason}`);
+
+        // Reconnect if not logged out
+        if (reason !== DisconnectReason.loggedOut && reason !== 401) {
+          logger.info(`Reconnecting ${clean}...`);
+          setTimeout(() => generatePairCode(clean), 3000);
+        } else {
+          // Clear session if logged out
+          try {
+            fs.rmSync(sessionDir, { recursive: true, force: true });
+          } catch {}
+          pendingPairs.delete(clean);
         }
       }
     });
 
-    // Timeout
+    // Timeout after 60s
     setTimeout(() => {
       if (!resolved) {
         resolved = true;
         try { sock.end(); } catch {}
-        reject(new Error('Timeout — try again'));
+        reject(new Error('Timeout — please try again'));
       }
     }, 60000);
   });
